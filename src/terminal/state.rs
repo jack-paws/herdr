@@ -5513,6 +5513,7 @@ mod tests {
             Duration::from_secs(1),
         );
         terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.observe_agent_prompt_ready(true);
         assert!(terminal.reconcile_managed_agent_at(now, false));
 
         for session in ["opencode-old", "opencode-new"] {

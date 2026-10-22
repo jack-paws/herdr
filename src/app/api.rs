@@ -1494,7 +1494,6 @@ mod tests {
         let (mut runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_process_pty_bytes(b"shell prompt");
         let _detection_events = runtime.test_start_basic_detection();
-        let reset_notify = runtime.agent_detection_reset_notify_for_test();
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         app.sync_full_lifecycle_authority_detection_pauses();
         app.terminal_runtimes
@@ -1516,6 +1515,9 @@ mod tests {
         assert!(app.state.terminals[&terminal_id].full_lifecycle_hook_authority_active());
         assert!(!app.state.terminals[&terminal_id].managed_agent_interactive_ready());
 
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let reset_notify = runtime.agent_detection_reset_notify_for_test();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         app.handle_internal_event(AppEvent::AgentPromptObserved {
             pane_id,
             ready: true,
