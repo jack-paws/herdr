@@ -869,6 +869,8 @@ mod tests {
             std::time::Duration::from_secs(10),
         );
         terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.reconcile_managed_agent_at(now + std::time::Duration::from_secs(4), false);
+        assert!(terminal.managed_agent_launch_pending());
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.state.insert_test_runtime(pane_id, runtime);
 

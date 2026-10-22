@@ -144,7 +144,7 @@ pub struct TerminalState {
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
-    codex_prompt_ready: bool,
+    agent_prompt_ready: bool,
     managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
@@ -184,7 +184,7 @@ impl TerminalState {
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
-            codex_prompt_ready: false,
+            agent_prompt_ready: false,
             managed_agent_launch_session: None,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
@@ -223,7 +223,7 @@ impl TerminalState {
             now,
         );
         if starts_acquisition {
-            self.codex_prompt_ready = false;
+            self.agent_prompt_ready = false;
             self.agent_process_acquisition_pending = true;
         }
         mutation
@@ -426,8 +426,12 @@ impl TerminalState {
             };
         }
         self.detected_agent = agent;
-        if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
-            self.codex_prompt_ready = false;
+        if process_exited
+            || previous_detected_agent != agent
+            || !matches!(agent, Some(Agent::Codex | Agent::OpenCode))
+            || fallback_state == AgentState::Blocked
+        {
+            self.agent_prompt_ready = false;
         }
         if let Some(agent) = agent {
             let agent_label = crate::detect::agent_label(agent);
@@ -2142,7 +2146,7 @@ impl TerminalState {
         settle_delay: Duration,
         timeout: Duration,
     ) {
-        self.codex_prompt_ready = false;
+        self.agent_prompt_ready = false;
         self.set_agent_name(name);
         self.agent_process_acquisition_pending = true;
         self.agent_name_owner = Some(AgentNameOwner {
@@ -2173,18 +2177,30 @@ impl TerminalState {
             .is_some_and(|managed| matches!(managed.phase, ManagedAgentPhase::Active))
     }
 
-    pub fn observe_codex_prompt_ready(&mut self, ready: bool) -> Option<TerminalStateMutation> {
-        if self.detected_agent != Some(Agent::Codex)
-            || self.recent_agent_process_exit.is_some()
+    pub fn observe_agent_prompt_ready(&mut self, ready: bool) -> Option<TerminalStateMutation> {
+        if self.recent_agent_process_exit.is_some()
             || !self.managed_agent.is_some_and(|managed| {
-                managed.kind == Agent::Codex && managed.phase != ManagedAgentPhase::Active
+                matches!(managed.kind, Agent::Codex | Agent::OpenCode)
+                    && self.detected_agent == Some(managed.kind)
+                    && managed.phase != ManagedAgentPhase::Active
             })
-            || self.codex_prompt_ready == ready
+            || self.agent_prompt_ready == ready
         {
             return None;
         }
-        self.codex_prompt_ready = ready;
+        self.agent_prompt_ready = ready;
         Some(TerminalStateMutation::default())
+    }
+
+    fn managed_agent_input_ready(&self, kind: Agent) -> bool {
+        match kind {
+            Agent::OpenCode => self.state == AgentState::Idle && self.agent_prompt_ready,
+            Agent::Codex => {
+                self.state == AgentState::Idle
+                    || self.state == AgentState::Unknown && self.agent_prompt_ready
+            }
+            _ => self.state == AgentState::Idle,
+        }
     }
 
     pub fn managed_agent_kind(&self) -> Option<Agent> {
@@ -2224,12 +2240,7 @@ impl TerminalState {
             return true;
         }
         if managed.phase == ManagedAgentPhase::Blocked {
-            if known_agent == Some(managed.kind)
-                && (self.state == AgentState::Idle
-                    || managed.kind == Agent::Codex
-                        && self.state == AgentState::Unknown
-                        && self.codex_prompt_ready)
-            {
+            if known_agent == Some(managed.kind) && self.managed_agent_input_ready(managed.kind) {
                 self.managed_agent = Some(ManagedAgent {
                     kind: managed.kind,
                     phase: ManagedAgentPhase::Active,
@@ -2257,11 +2268,7 @@ impl TerminalState {
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
-                if known_agent == Some(managed.kind)
-                    && (self.state == AgentState::Idle
-                        || managed.kind == Agent::Codex
-                            && self.state == AgentState::Unknown
-                            && self.codex_prompt_ready)
+                if known_agent == Some(managed.kind) && self.managed_agent_input_ready(managed.kind)
                 {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
@@ -2310,7 +2317,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_name(&mut self) {
-        self.codex_prompt_ready = false;
+        self.agent_prompt_ready = false;
         if self
             .managed_agent_launch_session
             .take()
@@ -2536,18 +2543,18 @@ mod tests {
             Duration::from_secs(1),
         );
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Unknown);
-        terminal.observe_codex_prompt_ready(true);
+        terminal.observe_agent_prompt_ready(true);
         terminal.reconcile_managed_agent_at(now, false);
         assert!(!terminal.managed_agent_interactive_ready());
-        terminal.observe_codex_prompt_ready(false);
+        terminal.observe_agent_prompt_ready(false);
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false));
         assert!(!terminal.managed_agent_interactive_ready());
 
-        terminal.observe_codex_prompt_ready(true);
+        terminal.observe_agent_prompt_ready(true);
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
         assert!(terminal.managed_agent_interactive_ready());
         assert_eq!(terminal.state, AgentState::Unknown);
-        terminal.observe_codex_prompt_ready(false);
+        terminal.observe_agent_prompt_ready(false);
         assert!(terminal.managed_agent_interactive_ready());
 
         terminal.begin_managed_agent(
@@ -2562,12 +2569,170 @@ mod tests {
 
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Blocked);
         assert!(terminal.reconcile_managed_agent_at(now, false));
-        terminal.observe_codex_prompt_ready(false);
+        terminal.observe_agent_prompt_ready(false);
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Unknown);
         assert!(!terminal.reconcile_managed_agent_at(now, false));
-        terminal.observe_codex_prompt_ready(true);
+        terminal.observe_agent_prompt_ready(true);
         assert!(terminal.reconcile_managed_agent_at(now, false));
         assert!(terminal.managed_agent_interactive_ready());
+    }
+
+    #[test]
+    fn opencode_managed_readiness_requires_current_prompt_after_settling() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false);
+        assert!(terminal.managed_agent_launch_pending());
+        assert!(!terminal.managed_agent_interactive_ready());
+
+        assert!(terminal.observe_agent_prompt_ready(true).is_some());
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
+        assert!(terminal.managed_agent_interactive_ready());
+        assert!(terminal.observe_agent_prompt_ready(false).is_none());
+        assert!(terminal.managed_agent_interactive_ready());
+    }
+
+    #[test]
+    fn opencode_managed_readiness_rejects_revoked_prompt_evidence() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.observe_agent_prompt_ready(true);
+        terminal.reconcile_managed_agent_at(now, false);
+        assert!(!terminal.managed_agent_interactive_ready());
+        terminal.observe_agent_prompt_ready(false);
+        terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false);
+        assert!(terminal.managed_agent_launch_pending());
+        assert!(!terminal.managed_agent_interactive_ready());
+
+        terminal.reconcile_managed_agent_at(now + Duration::from_secs(1), false);
+        assert_eq!(terminal.agent_name, None);
+        assert_eq!(terminal.managed_agent_kind(), None);
+        assert!(!terminal.agent_prompt_ready);
+    }
+
+    #[test]
+    fn opencode_managed_blocked_recovery_requires_current_idle_prompt() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.observe_agent_prompt_ready(true);
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Blocked);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+        assert!(!terminal.agent_prompt_ready);
+
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        assert!(!terminal.reconcile_managed_agent_at(now, false));
+        assert!(terminal.managed_agent_launch_pending());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Unknown);
+        terminal.observe_agent_prompt_ready(true);
+        assert!(!terminal.reconcile_managed_agent_at(now, false));
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+        assert!(terminal.managed_agent_interactive_ready());
+    }
+
+    #[test]
+    fn managed_prompt_evidence_resets_for_new_launches_and_processes() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.observe_agent_prompt_ready(true);
+        assert!(terminal.agent_prompt_ready);
+
+        terminal.begin_managed_agent(
+            "next".into(),
+            Agent::OpenCode,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        assert!(!terminal.agent_prompt_ready);
+        terminal.reconcile_managed_agent_at(now, false);
+        assert!(!terminal.managed_agent_interactive_ready());
+
+        terminal.observe_agent_prompt_ready(true);
+        terminal.set_detected_agent_process_at(Agent::OpenCode, now);
+        assert!(!terminal.agent_prompt_ready);
+        terminal.observe_agent_prompt_ready(true);
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert!(!terminal.agent_prompt_ready);
+        assert!(terminal.observe_agent_prompt_ready(true).is_none());
+    }
+
+    #[test]
+    fn managed_prompt_observations_reject_mismatched_and_exited_agents() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Unknown);
+        assert!(terminal.observe_agent_prompt_ready(true).is_none());
+        assert!(!terminal.agent_prompt_ready);
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.observe_agent_prompt_ready(true);
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Unknown);
+        assert!(!terminal.agent_prompt_ready);
+        assert!(terminal.observe_agent_prompt_ready(true).is_none());
+        terminal.reconcile_managed_agent_at(now, false);
+        assert_eq!(terminal.managed_agent_kind(), None);
+
+        terminal.begin_managed_agent(
+            "next".into(),
+            Agent::OpenCode,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.observe_agent_prompt_ready(true);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::OpenCode),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            now,
+        );
+        assert!(!terminal.agent_prompt_ready);
+        assert!(terminal.observe_agent_prompt_ready(true).is_none());
+        terminal.reconcile_managed_agent_at(now, true);
+        assert_eq!(terminal.managed_agent_kind(), None);
     }
 
     #[test]

@@ -360,21 +360,26 @@ pub(super) fn detection_update_for_publish_with_osc(
     (!detection.skip_state_update).then_some(detection)
 }
 
-pub(super) fn codex_prompt_ready(content: &str) -> bool {
-    // The composer can remain visible during a turn; this is startup evidence only.
-    let recent: String = content
-        .lines()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .flat_map(str::chars)
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
-    recent.contains("›AskCodextodoanything")
-        && !recent.contains("model:loading")
-        && !recent.contains("Resumingsession")
+pub(super) fn agent_prompt_ready(agent: Agent, content: &str) -> bool {
+    let mut recent = content.trim_end().lines().rev().take(12);
+    match agent {
+        Agent::Codex => {
+            let text: String = recent
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .flat_map(str::chars)
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            text.contains("›AskCodextodoanything")
+                && !text.contains("model:loading")
+                && !text.contains("Resumingsession")
+        }
+        Agent::OpenCode => recent
+            .find_map(|line| line.trim_start().strip_prefix('┃'))
+            .is_some_and(|metadata| !metadata.trim().is_empty()),
+        _ => false,
+    }
 }
 
 pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_seq: &AtomicU64) {
@@ -500,8 +505,11 @@ mod tests {
     #[test]
     fn codex_startup_prompt_survives_terminal_wraps() {
         let wrapped = "header\n› Ask Codex to do\nanything\nfooter";
-        assert!(codex_prompt_ready(wrapped));
-        assert!(!codex_prompt_ready(&format!("model: load\ning\n{wrapped}")));
+        assert!(agent_prompt_ready(Agent::Codex, wrapped));
+        assert!(!agent_prompt_ready(
+            Agent::Codex,
+            &format!("model: load\ning\n{wrapped}")
+        ));
     }
 
     #[test]

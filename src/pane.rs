@@ -35,7 +35,7 @@ mod terminal;
 mod xtgettcap;
 
 use self::agent_detection::{
-    codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
+    agent_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
     DetectionScreenReadInput, DetectionTextCache, PendingIdleConfirmation,
@@ -308,7 +308,7 @@ async fn publish_agent_process_detected_event(
     }
 }
 
-async fn publish_codex_prompt_observation(
+async fn publish_agent_prompt_observation(
     state_events: &mpsc::Sender<AppEvent>,
     pane_id: PaneId,
     agent: Option<Agent>,
@@ -317,19 +317,22 @@ async fn publish_codex_prompt_observation(
     process_exited: bool,
     last_ready: &mut bool,
 ) {
-    let ready = agent == Some(Agent::Codex)
-        && !process_exited
-        && detection.is_some_and(|detection| detection.state == AgentState::Unknown)
-        && codex_prompt_ready(content);
+    let ready = !process_exited
+        && detection.is_some_and(|detection| match agent {
+            Some(Agent::Codex) => detection.state == AgentState::Unknown,
+            Some(Agent::OpenCode) => detection.state == AgentState::Idle,
+            _ => false,
+        })
+        && agent.is_some_and(|agent| agent_prompt_ready(agent, content));
     if ready == *last_ready {
         return;
     }
     *last_ready = ready;
     if let Err(err) = state_events
-        .send(AppEvent::CodexPromptObserved { pane_id, ready })
+        .send(AppEvent::AgentPromptObserved { pane_id, ready })
         .await
     {
-        warn!(pane = pane_id.raw(), %err, "failed to deliver Codex prompt observation");
+        warn!(pane = pane_id.raw(), %err, "failed to deliver agent prompt observation");
     }
 }
 
@@ -964,7 +967,7 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
-        let mut last_codex_prompt_ready = false;
+        let mut last_agent_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
         let mut agent_job = AgentJobTracker::default();
 
@@ -977,9 +980,9 @@ fn spawn_basic_detection_task(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_reset.notified() => {
-                    publish_codex_prompt_observation(
-                        &state_events, pane_id, Some(Agent::Codex), "", None, false,
-                        &mut last_codex_prompt_ready,
+                    publish_agent_prompt_observation(
+                        &state_events, pane_id, None, "", None, false,
+                        &mut last_agent_prompt_ready,
                     ).await;
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
@@ -1100,7 +1103,7 @@ fn spawn_basic_detection_task(
                             == ForegroundShellAgentAction::ReportReplacementProcess;
                     if agent_changed {
                         pending_idle.clear();
-                        last_codex_prompt_ready = false;
+                        last_agent_prompt_ready = false;
                         last_screen_scan_detection_content_seq = None;
                         // A replacement agent must not inherit OSC evidence
                         // from the previous process; a first acquisition keeps
@@ -1185,14 +1188,14 @@ fn spawn_basic_detection_task(
                 &osc_progress,
                 process_exited,
             );
-            publish_codex_prompt_observation(
+            publish_agent_prompt_observation(
                 &state_events,
                 pane_id,
                 agent,
                 content,
                 screen_detection.as_ref(),
                 process_exited,
-                &mut last_codex_prompt_ready,
+                &mut last_agent_prompt_ready,
             )
             .await;
             let Some(screen_detection) = screen_detection else {
@@ -2889,7 +2892,7 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
-                let mut last_codex_prompt_ready = false;
+                let mut last_agent_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
                 let mut agent_job = AgentJobTracker::default();
 
@@ -2912,9 +2915,9 @@ impl PaneRuntime {
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_reset.notified() => {
-                            publish_codex_prompt_observation(
-                                &state_events, pane_id, Some(Agent::Codex), "", None, false,
-                                &mut last_codex_prompt_ready,
+                            publish_agent_prompt_observation(
+                                &state_events, pane_id, None, "", None, false,
+                                &mut last_agent_prompt_ready,
                             ).await;
                             agent_presence = AgentDetectionPresence::from_agent(None);
                             state = AgentState::Unknown;
@@ -3071,7 +3074,7 @@ impl PaneRuntime {
                                         == ForegroundShellAgentAction::ReportReplacementProcess
                                 {
                                     pending_idle.clear();
-                                    last_codex_prompt_ready = false;
+                                    last_agent_prompt_ready = false;
                                     last_screen_scan_detection_content_seq = None;
                                     // A replacement agent must not inherit OSC
                                     // evidence from the previous process; a first
@@ -3193,14 +3196,14 @@ impl PaneRuntime {
                         &osc_progress,
                         process_exited,
                     );
-                    publish_codex_prompt_observation(
+                    publish_agent_prompt_observation(
                         &state_events,
                         pane_id,
                         agent,
                         content,
                         screen_detection.as_ref(),
                         process_exited,
-                        &mut last_codex_prompt_ready,
+                        &mut last_agent_prompt_ready,
                     )
                     .await;
                     let Some(screen_detection) = screen_detection else {
@@ -6754,7 +6757,7 @@ mod tests {
         };
         let mut last_ready = false;
         let prompt = "› Ask Codex to do anything";
-        publish_codex_prompt_observation(
+        publish_agent_prompt_observation(
             &tx,
             pane_id,
             Some(Agent::Codex),
@@ -6766,9 +6769,9 @@ mod tests {
         .await;
         assert!(matches!(
             rx.recv().await,
-            Some(AppEvent::CodexPromptObserved { ready: true, .. })
+            Some(AppEvent::AgentPromptObserved { ready: true, .. })
         ));
-        publish_codex_prompt_observation(
+        publish_agent_prompt_observation(
             &tx,
             pane_id,
             Some(Agent::Codex),
@@ -6783,7 +6786,7 @@ mod tests {
             state: AgentState::Working,
             ..detection
         };
-        publish_codex_prompt_observation(
+        publish_agent_prompt_observation(
             &tx,
             pane_id,
             Some(Agent::Codex),
@@ -6795,9 +6798,9 @@ mod tests {
         .await;
         assert!(matches!(
             rx.recv().await,
-            Some(AppEvent::CodexPromptObserved { ready: false, .. })
+            Some(AppEvent::AgentPromptObserved { ready: false, .. })
         ));
-        publish_codex_prompt_observation(
+        publish_agent_prompt_observation(
             &tx,
             pane_id,
             Some(Agent::Codex),
@@ -6809,9 +6812,9 @@ mod tests {
         .await;
         assert!(matches!(
             rx.recv().await,
-            Some(AppEvent::CodexPromptObserved { ready: true, .. })
+            Some(AppEvent::AgentPromptObserved { ready: true, .. })
         ));
-        publish_codex_prompt_observation(
+        publish_agent_prompt_observation(
             &tx,
             pane_id,
             Some(Agent::Codex),
@@ -6823,9 +6826,9 @@ mod tests {
         .await;
         assert!(matches!(
             rx.recv().await,
-            Some(AppEvent::CodexPromptObserved { ready: false, .. })
+            Some(AppEvent::AgentPromptObserved { ready: false, .. })
         ));
-        publish_codex_prompt_observation(
+        publish_agent_prompt_observation(
             &tx,
             pane_id,
             Some(Agent::Codex),
@@ -6837,7 +6840,7 @@ mod tests {
         .await;
         assert!(matches!(
             rx.recv().await,
-            Some(AppEvent::CodexPromptObserved { ready: true, .. })
+            Some(AppEvent::AgentPromptObserved { ready: true, .. })
         ));
     }
 }

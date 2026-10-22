@@ -487,8 +487,11 @@ impl App {
                     else {
                         continue;
                     };
+                    let startup_prompt_pending = terminal.managed_agent_kind()
+                        == Some(crate::detect::Agent::OpenCode)
+                        && terminal.managed_agent_launch_pending();
                     runtime.set_full_lifecycle_authority_active(
-                        terminal.full_lifecycle_hook_authority_active(),
+                        terminal.full_lifecycle_hook_authority_active() && !startup_prompt_pending,
                     );
                     runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
                 }
@@ -1444,6 +1447,83 @@ mod tests {
             },
         );
         app
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_opencode_startup_scans_with_hook_authority_until_prompt_is_ready() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("startup-readiness")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let session_ref = crate::agent_resume::AgentSessionRef::id("startup-session").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:opencode".into(),
+            agent: "opencode".into(),
+            session_ref: session_ref.clone(),
+        });
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Idle,
+            None,
+            Some(session_ref),
+            Some(1),
+        );
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        assert!(terminal.managed_agent_launch_pending());
+        let (mut runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"shell prompt");
+        let _detection_events = runtime.test_start_basic_detection();
+        let reset_notify = runtime.agent_detection_reset_notify_for_test();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        app.sync_full_lifecycle_authority_detection_pauses();
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_wait_for_detection_reads(1)
+            .await;
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::OpenCode),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        assert_eq!(app.state.terminals[&terminal_id].state, AgentState::Idle);
+        assert!(app.state.terminals[&terminal_id].full_lifecycle_hook_authority_active());
+        assert!(!app.state.terminals[&terminal_id].managed_agent_interactive_ready());
+
+        app.handle_internal_event(AppEvent::AgentPromptObserved {
+            pane_id,
+            ready: true,
+        });
+        assert!(app.state.terminals[&terminal_id].managed_agent_interactive_ready());
+        tokio::time::timeout(Duration::from_millis(50), reset_notify.notified())
+            .await
+            .expect("ready agent should resume pausing screen detection under hook authority");
     }
 
     #[tokio::test]
