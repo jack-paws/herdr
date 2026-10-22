@@ -361,10 +361,11 @@ pub(super) fn detection_update_for_publish_with_osc(
 }
 
 pub(super) fn agent_prompt_ready(agent: Agent, content: &str) -> bool {
-    let mut recent = content.trim_end().lines().rev().take(12);
+    let recent = content.lines().rev();
     match agent {
         Agent::Codex => {
             let text: String = recent
+                .take(12)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -376,6 +377,8 @@ pub(super) fn agent_prompt_ready(agent: Agent, content: &str) -> bool {
                 && !text.contains("Resumingsession")
         }
         Agent::OpenCode => recent
+            .filter(|line| !line.trim().is_empty())
+            .take(12)
             .find_map(|line| line.trim_start().strip_prefix('┃'))
             .is_some_and(|metadata| !metadata.trim().is_empty()),
         _ => false,
